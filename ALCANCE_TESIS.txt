@@ -1,0 +1,3 @@
+Texto para incorporar al alcance de la tesis:
+
+La validación funcional del módulo de disponibilidad se realizará en un entorno de laboratorio simulado, mediante cámaras virtuales y estados de respuesta controlados, con el propósito de verificar la generación y cierre de alertas, su conversión en riesgos y el cálculo del indicador de disponibilidad. Esta validación no implica conexión, monitoreo ni intervención sobre la infraestructura o los datos reales de la Municipalidad de Miraflores.
