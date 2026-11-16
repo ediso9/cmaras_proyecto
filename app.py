@@ -55,12 +55,9 @@ def init(seed=True):
  c=db(); schema='''
  CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,username TEXT UNIQUE,password TEXT,role TEXT);
  CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY,code TEXT UNIQUE,name TEXT,description TEXT,category TEXT,location TEXT,owner TEXT,criticality TEXT,evaluated INTEGER DEFAULT 0);
- CREATE TABLE IF NOT EXISTS cameras(id INTEGER PRIMARY KEY,code TEXT UNIQUE,name TEXT,zone TEXT,kind TEXT,status TEXT,notes TEXT,asset_id INTEGER REFERENCES assets(id) ON DELETE SET NULL);
- CREATE TABLE IF NOT EXISTS camera_checks(id INTEGER PRIMARY KEY,camera_id INTEGER REFERENCES cameras(id) ON DELETE CASCADE,responded INTEGER NOT NULL,checked_at TEXT NOT NULL,mode TEXT DEFAULT 'simulado');
  CREATE TABLE IF NOT EXISTS vulnerabilities(id INTEGER PRIMARY KEY,code TEXT UNIQUE,title TEXT,kind TEXT,severity TEXT,asset_id INTEGER REFERENCES assets(id) ON DELETE SET NULL,source TEXT NOT NULL,state TEXT,description TEXT);
  CREATE TABLE IF NOT EXISTS threats(id INTEGER PRIMARY KEY,name TEXT UNIQUE,description TEXT,source TEXT);
  CREATE TABLE IF NOT EXISTS risks(id INTEGER PRIMARY KEY,vulnerability_id INTEGER REFERENCES vulnerabilities(id) ON DELETE CASCADE,threat_id INTEGER REFERENCES threats(id),p INTEGER,c INTEGER,i INTEGER,d INTEGER,impact INTEGER,score INTEGER,level TEXT,treatment_option TEXT,control TEXT,owner TEXT,start_date TEXT,due TEXT,status TEXT,notes TEXT);
- CREATE TABLE IF NOT EXISTS camera_alerts(id INTEGER PRIMARY KEY,camera_id INTEGER REFERENCES cameras(id) ON DELETE CASCADE,message TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'Abierta',opened_at TEXT NOT NULL,closed_at TEXT,risk_id INTEGER REFERENCES risks(id) ON DELETE SET NULL);
  CREATE TABLE IF NOT EXISTS treatments(id INTEGER PRIMARY KEY,risk_id INTEGER REFERENCES risks(id) ON DELETE CASCADE,action TEXT,owner TEXT,start_date TEXT,due TEXT,status TEXT,control TEXT,notes TEXT);
  CREATE TABLE IF NOT EXISTS sovereignty(id INTEGER PRIMARY KEY,asset_id INTEGER REFERENCES assets(id) ON DELETE CASCADE,provider TEXT,dimension TEXT,score INTEGER,justification TEXT,updated_at TEXT);
  CREATE TABLE IF NOT EXISTS policies(id INTEGER PRIMARY KEY,name TEXT,description TEXT,status TEXT,evidence TEXT);
@@ -101,22 +98,6 @@ def auth():
  if request.method=='POST' and request.endpoint not in ('login','logout') and not can_edit():
   flash('El rol Auditor tiene permisos de solo lectura.'); return redirect(request.referrer or url_for('home'))
 def page(name, **kwargs): return render_template('module.html',page=name,role=session.get('role'),**kwargs)
-def check_simulated_cameras(c):
- """Registra comprobaciones de disponibilidad únicamente sobre estados simulados."""
- now=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
- cams=c.execute('SELECT * FROM cameras').fetchall()
- for cam in cams:
-  # Solo el estado elegido en el laboratorio determina la respuesta; nunca se hace ping real.
-  responded = 1 if cam['status'] in ('Disponible (simulado)','Simulada') else 0
-  c.execute('INSERT INTO camera_checks(camera_id,responded,checked_at,mode) VALUES(?,?,?,?)',(cam['id'],responded,now,'simulado'))
-  active=c.execute("SELECT id FROM camera_alerts WHERE camera_id=? AND status='Abierta' ORDER BY id DESC LIMIT 1",(cam['id'],)).fetchone()
-  if not responded:
-   if not active:
-    c.execute('INSERT INTO camera_alerts(camera_id,message,status,opened_at) VALUES(?,?,?,?)',(cam['id'],'La cámara de laboratorio no responde en la comprobación simulada.','Abierta',now))
-  elif active:
-   c.execute("UPDATE camera_alerts SET status='Cerrada',closed_at=? WHERE id=?",(now,active['id']))
- c.commit()
-
 @app.route('/')
 def home():
  c=db(); assets=c.execute('SELECT COUNT(*) FROM assets').fetchone()[0]; vulns=c.execute('SELECT COUNT(*) FROM vulnerabilities').fetchone()[0]; threats=c.execute('SELECT COUNT(*) FROM threats').fetchone()[0]; risks=c.execute('SELECT * FROM risks').fetchall(); nrisks=len(risks); avg=round(sum(r['score'] for r in risks)/nrisks,2) if nrisks else 0; treated=c.execute("SELECT COUNT(DISTINCT risk_id) FROM treatments WHERE status='Completado'").fetchone()[0]; prt=round(treated/nrisks*100,1) if nrisks else 0; vtreated=c.execute("SELECT COUNT(DISTINCT v.id) FROM vulnerabilities v JOIN risks r ON r.vulnerability_id=v.id WHERE r.status='Completado'").fetchone()[0]; vtotal=c.execute('SELECT COUNT(*) FROM vulnerabilities').fetchone()[0]; vtp=round(vtreated/vtotal*100,1) if vtotal else 0
@@ -141,44 +122,6 @@ def assets():
 @app.route('/assets/evaluated/<int:id>',methods=['POST'])
 def asset_eval(id):
  c=db(); c.execute('UPDATE assets SET evaluated=? WHERE id=?',(int(request.form.get('evaluated','0')),id)); c.commit(); c.close(); return redirect(url_for('assets'))
-@app.route('/cameras',methods=['GET','POST'])
-def cameras():
- c=db()
- if request.method=='POST':
-  try: c.execute('INSERT INTO cameras(code,name,zone,kind,status,notes,asset_id) VALUES(?,?,?,?,?,?,?)',(request.form['code'],request.form['name'],request.form.get('zone','Entorno simulado'),request.form.get('kind','IP simulada'),request.form.get('status','Simulada'),request.form.get('notes','Monitor de disponibilidad simulado; no hay conexión real.'),request.form.get('asset_id') or None)); c.commit(); flash('Cámara simulada registrada. No se conectó a un dispositivo real.')
-  except IntegrityError: flash('El código de cámara ya existe.')
-  c.close(); return redirect(url_for('cameras'))
- check_simulated_cameras(c); rows=c.execute('SELECT cam.*,a.name asset,(SELECT MAX(checked_at) FROM camera_checks cc WHERE cc.camera_id=cam.id) last_check FROM cameras cam LEFT JOIN assets a ON a.id=cam.asset_id ORDER BY cam.id DESC').fetchall(); aset=c.execute('SELECT * FROM assets').fetchall(); alerts=c.execute('SELECT al.*,cam.code camera_code,cam.name camera_name FROM camera_alerts al JOIN cameras cam ON cam.id=al.camera_id ORDER BY al.id DESC LIMIT 50').fetchall(); counts=c.execute('SELECT COUNT(*) total,COALESCE(SUM(responded),0) ok FROM camera_checks').fetchone(); availability=round(counts['ok']/counts['total']*100,1) if counts['total'] else 0; c.close(); return page('cameras',rows=rows,assets=aset,alerts=alerts,availability=availability)
-@app.route('/cameras/status/<int:id>',methods=['POST'])
-def camstatus(id):
- c=db(); c.execute('UPDATE cameras SET status=? WHERE id=?',(request.form['status'],id)); check_simulated_cameras(c); c.close(); flash('Estado simulado actualizado y disponibilidad comprobada.'); return redirect(url_for('cameras'))
-
-@app.route('/cameras/check',methods=['POST'])
-def camera_check_now():
- c=db(); check_simulated_cameras(c); c.close(); flash('Comprobación simulada ejecutada; las alertas se abrieron o cerraron según el estado seleccionado.'); return redirect(url_for('cameras'))
-
-@app.route('/cameras/auto-check')
-def camera_auto_check():
- c=db(); check_simulated_cameras(c); c.close(); return {'ok':True,'mode':'simulado','message':'Comprobación de estados simulados completada.'}
-@app.route('/cameras/alerts/<int:alert_id>/risk',methods=['POST'])
-def camera_alert_to_risk(alert_id):
- c=db(); alert=c.execute("SELECT al.*,cam.name camera_name,cam.asset_id FROM camera_alerts al JOIN cameras cam ON cam.id=al.camera_id WHERE al.id=?",(alert_id,)).fetchone()
- if not alert:
-  c.close(); flash('No se encontró la alerta.'); return redirect(url_for('cameras'))
- if alert['risk_id']:
-  c.close(); flash('Esta alerta ya está vinculada al riesgo registrado.'); return redirect(url_for('cameras'))
- vuln=c.execute("SELECT id FROM vulnerabilities WHERE code='VUL-CAM-DISP' LIMIT 1").fetchone()
- if not vuln:
-  c.execute("INSERT INTO vulnerabilities(code,title,kind,severity,asset_id,source,state,description) VALUES(?,?,?,?,?,?,?,?)",('VUL-CAM-DISP','Indisponibilidad de cámara en entorno simulado','Configuración insegura','Media',alert['asset_id'],'Registro de simulación RiskVision','Potencial','Vulnerabilidad/escenario creado a partir de una alerta simulada; no demuestra una falla real.'))
-  vid=c.execute("SELECT id FROM vulnerabilities WHERE code='VUL-CAM-DISP'").fetchone()['id']
- else: vid=vuln['id']
- threat=c.execute("SELECT id FROM threats WHERE name='Denegación de servicio (DoS)'").fetchone()
- if not threat:
-  c.execute('INSERT INTO threats(name,description,source) VALUES(?,?,?)',('Denegación de servicio (DoS)','Pérdida de disponibilidad del servicio.','Escenario académico simulado'))
-  threat=c.execute("SELECT id FROM threats WHERE name='Denegación de servicio (DoS)'").fetchone()
- p,cval,ival,dval=3,1,2,4; impact=max(cval,ival,dval); score=p*impact
- rid=c.execute('INSERT INTO risks(vulnerability_id,threat_id,p,c,i,d,impact,score,level,treatment_option,control,owner,start_date,due,status,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id',(vid,threat['id'],p,cval,ival,dval,impact,score,band(score),'Mitigar','ISO/IEC 27002:2022 — por mapear','Por asignar',date.today().isoformat(),'','Pendiente','Generado desde alerta de disponibilidad simulada. No representa una cámara real.')).fetchone()[0]; c.execute('UPDATE camera_alerts SET risk_id=? WHERE id=?',(rid,alert_id)); c.commit(); c.close(); flash(f'Alerta convertida en riesgo de referencia ({score}/25, {band(score)}).'); return redirect(url_for('cameras'))
-
 @app.route('/vulnerabilities',methods=['GET','POST'])
 def vulnerabilities():
  c=db()
@@ -233,10 +176,10 @@ def policies():
  rows=c.execute('SELECT * FROM policies').fetchall(); c.close(); return page('policies',rows=rows)
 @app.route('/reports')
 def reports():
- c=db(); summary={t:c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] for t in ['assets','vulnerabilities','threats','risks','treatments','sovereignty','camera_alerts']}; rows=c.execute('SELECT r.*,v.code vcode,v.title vulnerability,t.name threat FROM risks r JOIN vulnerabilities v ON v.id=r.vulnerability_id JOIN threats t ON t.id=r.threat_id ORDER BY r.score DESC').fetchall(); assetsrows=c.execute('SELECT * FROM assets ORDER BY id').fetchall(); vulnrows=c.execute('SELECT v.*,a.name asset FROM vulnerabilities v LEFT JOIN assets a ON a.id=v.asset_id ORDER BY v.id').fetchall(); threatrows=c.execute('SELECT * FROM threats ORDER BY id').fetchall(); treatmentrows=c.execute('SELECT tr.*,r.score,r.level,v.title vulnerability FROM treatments tr JOIN risks r ON r.id=tr.risk_id JOIN vulnerabilities v ON v.id=r.vulnerability_id ORDER BY tr.id').fetchall(); sobrows=c.execute('SELECT s.*,a.name asset FROM sovereignty s JOIN assets a ON a.id=s.asset_id ORDER BY s.id').fetchall(); policyrows=c.execute('SELECT * FROM policies').fetchall(); c.close(); return page('reports',summary=summary,rows=rows,assetsrows=assetsrows,vulnrows=vulnrows,threatrows=threatrows,treatmentrows=treatmentrows,sobrows=sobrows,policyrows=policyrows)
+ c=db(); summary={t:c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0] for t in ['assets','vulnerabilities','threats','risks','treatments','sovereignty']}; rows=c.execute('SELECT r.*,v.code vcode,v.title vulnerability,t.name threat FROM risks r JOIN vulnerabilities v ON v.id=r.vulnerability_id JOIN threats t ON t.id=r.threat_id ORDER BY r.score DESC').fetchall(); assetsrows=c.execute('SELECT * FROM assets ORDER BY id').fetchall(); vulnrows=c.execute('SELECT v.*,a.name asset FROM vulnerabilities v LEFT JOIN assets a ON a.id=v.asset_id ORDER BY v.id').fetchall(); threatrows=c.execute('SELECT * FROM threats ORDER BY id').fetchall(); treatmentrows=c.execute('SELECT tr.*,r.score,r.level,v.title vulnerability FROM treatments tr JOIN risks r ON r.id=tr.risk_id JOIN vulnerabilities v ON v.id=r.vulnerability_id ORDER BY tr.id').fetchall(); sobrows=c.execute('SELECT s.*,a.name asset FROM sovereignty s JOIN assets a ON a.id=s.asset_id ORDER BY s.id').fetchall(); policyrows=c.execute('SELECT * FROM policies').fetchall(); c.close(); return page('reports',summary=summary,rows=rows,assetsrows=assetsrows,vulnrows=vulnrows,threatrows=threatrows,treatmentrows=treatmentrows,sobrows=sobrows,policyrows=policyrows)
 @app.route('/export/<kind>')
 def export(kind):
- allowed={'cameras':'SELECT code,name,zone,kind,status,notes,asset_id FROM cameras','assets':'SELECT code,name,description,category,location,owner,criticality,evaluated FROM assets','vulnerabilities':'SELECT code,title,kind,severity,asset_id,source,state,description FROM vulnerabilities','threats':'SELECT name,description,source FROM threats','risks':'SELECT id,vulnerability_id,threat_id,p,c,i,d,impact,score,level,treatment_option,control,owner,start_date,due,status,notes FROM risks','treatments':'SELECT * FROM treatments','sovereignty':'SELECT * FROM sovereignty','policies':'SELECT * FROM policies','camera_alerts':'SELECT id,camera_id,message,status,opened_at,closed_at,risk_id FROM camera_alerts'}
+ allowed={'assets':'SELECT code,name,description,category,location,owner,criticality,evaluated FROM assets','vulnerabilities':'SELECT code,title,kind,severity,asset_id,source,state,description FROM vulnerabilities','threats':'SELECT name,description,source FROM threats','risks':'SELECT id,vulnerability_id,threat_id,p,c,i,d,impact,score,level,treatment_option,control,owner,start_date,due,status,notes FROM risks','treatments':'SELECT * FROM treatments','sovereignty':'SELECT * FROM sovereignty','policies':'SELECT * FROM policies'}
  if kind not in allowed: return 'Tipo no válido',404
  c=db(); rows=c.execute(allowed[kind]).fetchall(); c.close(); out=io.StringIO(); w=csv.writer(out); w.writerow(rows[0].keys() if rows else ['sin_registros']); [w.writerow(tuple(r)) for r in rows]; return Response('\ufeff'+out.getvalue(),mimetype='text/csv; charset=utf-8',headers={'Content-Disposition':f'attachment; filename=riskvision_{kind}.csv'})
 if __name__=='__main__': init(seed=not DATABASE_URL); app.run(debug=False)
