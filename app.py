@@ -1,4 +1,3 @@
- python
 from flask import Flask, render_template, request, redirect, url_for, flash, session, Response
 import sqlite3, os, csv, io, json
 import psycopg
